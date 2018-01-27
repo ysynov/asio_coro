@@ -18,98 +18,18 @@
 
 using boost::asio::ip::tcp;
 
-namespace mycoro {
-
-
-template<typename T>
-struct coreturn {
-    struct promise;
-    friend struct promise;
-    using handle_type = std::experimental::coroutine_handle<promise>;
-    coreturn(const coreturn &) = delete;
-    coreturn(coreturn &&s)
-    : coro(s.coro) {
-        std::cout << "Coreturn wrapper moved" << std::endl;
-        s.coro = nullptr;
-    }
-    ~coreturn() {
-        std::cout << "Coreturn wrapper gone" << std::endl;
-        //if ( coro && coro.done()) coro.destroy();
-    }
-    coreturn &operator = (const coreturn &) = delete;
-    coreturn &operator = (coreturn &&s) {
-        coro = s.coro;
-        s.coro = nullptr;
-        return *this;
-    }
-    struct promise {
-        friend struct coreturn;
-        promise() {
-            std::cout << "Promise created" << std::endl;
-        }
-        ~promise() {
-            std::cout << "Promise died" << std::endl;
-        }
-
-        /*
-        auto return_value(T v) {
-            std::cout << "Got an answer of " << v << std::endl;
-            value = v;
-            return std::experimental::suspend_never{};
-        }
-        */
-        auto return_void() {
-            std::cout << "return_void" << std::endl;
-            return std::experimental::suspend_never{};
-        }
-
-        auto final_suspend() {
-            std::cout << "Finished the coro" << std::endl;
-            return std::experimental::suspend_never{};
-        }
+template <typename... Args>
+struct std::experimental::coroutine_traits<void, Args...> {
+    struct promise_type {
+        void get_return_object() { }
+        std::experimental::suspend_never initial_suspend() { return {}; }
+        std::experimental::suspend_never final_suspend() { return {}; }
+        void return_void() { }
         void unhandled_exception() {
-            std::exit(1);
-        }
-    private:
-        //T value;
-    };
-protected:
-    /*
-    T get() {
-        //return coro.promise().value;
-    }
-    */
-    coreturn(handle_type h)
-    : coro(h) {
-        std::cout << "Created a coreturn wrapper object" << std::endl;
-    }
-    handle_type coro;
-};
-
-template<typename T>
-struct sync : public coreturn<T> {
-    using coreturn<T>::coreturn;
-    using handle_type = typename coreturn<T>::handle_type;
-    /*
-    T get() {
-        std::cout << "We got asked for the return value..." << std::endl;
-        if ( not this->coro.done() ) this->coro.resume();
-        return coreturn<T>::get();
-    }
-    */
-    struct promise_type : public coreturn<T>::promise {
-        auto get_return_object() {
-            std::cout << "Send back a sync" << std::endl;
-            return sync<T>{handle_type::from_promise(*this)};
-        }
-        auto initial_suspend() {
-            std::cout << "Started the coroutine, don't stop now!" << std::endl;
-            return std::experimental::suspend_never{};
+         std::exit(1);
         }
     };
 };
-
-}
 
 template <typename SyncReadStream, typename DynamicBuffer>
 auto async_read_some(SyncReadStream &s, DynamicBuffer &&buffers) {
@@ -122,9 +42,7 @@ auto async_read_some(SyncReadStream &s, DynamicBuffer &&buffers) {
 
     bool await_ready() { return false; }
     auto await_resume() {
-      if (ec)
-        throw std::system_error(ec);
-      return sz;
+      return std::make_pair(ec, sz);
     }
     void await_suspend(std::experimental::coroutine_handle<> coro) {
       s.async_read_some(std::move(buffers),
@@ -153,27 +71,22 @@ public:
   }
 
 private:
-  mycoro::sync<void> do_read()
+  void do_read()
   {
     auto self(shared_from_this());
     while (true)
     {
-        auto res = co_await async_read_some(socket_, boost::asio::buffer(data_, max_length));
-        std::cout << "after await" << std::endl;
-        do_write(res);
-    }
-
-    /*
-    socket_.async_read_some(boost::asio::buffer(data_, max_length),
-        [this, self](boost::system::error_code ec, std::size_t length)
+        const auto [ec, sz] = co_await async_read_some(socket_, boost::asio::buffer(data_, max_length));
+        if (!ec)
         {
-          if (!ec)
-          {
-            do_write(length);
-          }
-        });
-    */
-    //co_return 0;
+            do_write(sz);
+        }
+        else
+        {
+            std::cout << "Error: " << ec << std::endl;
+            break;
+        }
+    }
   }
 
   void do_write(std::size_t length)
@@ -182,9 +95,9 @@ private:
     boost::asio::async_write(socket_, boost::asio::buffer(data_, length),
         [this, self](boost::system::error_code ec, std::size_t /*length*/)
         {
-          if (!ec)
+          if (ec)
           {
-            //do_read();
+            std::cout << "Error: " << ec << std::endl;
           }
         });
   }
