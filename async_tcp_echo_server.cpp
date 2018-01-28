@@ -26,7 +26,7 @@ struct std::experimental::coroutine_traits<std::error_code, Args...> {
     std::experimental::suspend_never initial_suspend() { return {}; }
     std::experimental::suspend_never final_suspend() { return {}; }
     void return_value(std::error_code v) { res = v; }
-    void unhandled_exception() { std::exit(1); }
+    void unhandled_exception() { std::terminate(); }
   };
 };
 
@@ -37,7 +37,7 @@ struct std::experimental::coroutine_traits<void, Args...> {
     std::experimental::suspend_never initial_suspend() { return {}; }
     std::experimental::suspend_never final_suspend() { return {}; }
     void return_void() {}
-    void unhandled_exception() { std::exit(1); }
+    void unhandled_exception() { std::terminate(); }
   };
 };
 
@@ -87,6 +87,26 @@ auto async_write(SyncReadStream &s, DynamicBuffer &&buffers) {
   return Awaiter{s, std::forward<DynamicBuffer>(buffers)};
 }
 
+template <typename Acceptor> auto async_accept(Acceptor &acceptor) {
+  struct Awaiter {
+    Acceptor &acceptor;
+
+    tcp::socket socket;
+    std::error_code ec;
+
+    bool await_ready() { return false; }
+    auto await_resume() { return std::make_pair(ec, std::move(socket)); }
+    void await_suspend(std::experimental::coroutine_handle<> coro) {
+      acceptor.async_accept([this, coro](auto ec, auto socket) mutable {
+        this->ec = ec;
+        this->socket = std::move(socket);
+        coro.resume();
+      });
+    }
+  };
+  return Awaiter{acceptor, tcp::socket(acceptor.get_executor().context())};
+}
+
 class session : public std::enable_shared_from_this<session> {
 public:
   session(tcp::socket socket) : socket_(std::move(socket)) {}
@@ -133,14 +153,14 @@ public:
 
 private:
   void do_accept() {
-    acceptor_.async_accept(
-        [this](boost::system::error_code ec, tcp::socket socket) {
-          if (!ec) {
-            std::make_shared<session>(std::move(socket))->start();
-          }
-
-          do_accept();
-        });
+    while (true) {
+      auto[ec, socket] = co_await async_accept(acceptor_);
+      if (!ec) {
+        std::make_shared<session>(std::move(socket))->start();
+      } else {
+        std::cout << "Error accepting connection: " << ec << std::endl;
+      }
+    }
   }
 
   tcp::acceptor acceptor_;
