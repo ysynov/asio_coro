@@ -1,0 +1,217 @@
+<h1>Введение</h1>
+
+<p>Использование функций обратного вызова (callback) - популярный подход к построению сетевых приложений с использованием библиотеки Boost.Asio (и не только ее). Проблемой этого подхода является ухудшение читабельности и поддерживаемости кода при усложнении логики протокола обмена данными <a href="https://habrahabr.ru/post/201826/">[1]</a>.</p>
+<p>Как альтернатива коллбекам, сопрограммы (coroutines) можно применить для написания асинхронного кода, уровень читабельности которого будет близок к читабельности синхронного кода. Boost.Asio поддерживает такой подход, предоставляя возможность использования библиотеки Boost.Coroutine для обработки коллбеков.</p>
+<p>Boost.Coroutine реализует сопрограммы с помощью сохранения контекста выполнения текущего потока. Этот подход конкурировал за включение в следующую редакцию стандарта C++ с предложением от Microsoft, которое вводит новые ключевые слова co_return, co_yield и co_await. Предложение Microsoft получило статус Technical Specification (TS) <a href="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2017/n4649.pdf">[2]</a> и имеет высокие шансы стать стандартом.</p>
+<p>Статья <a href="https://blogs.msdn.microsoft.com/vcblog/2017/05/19/using-c-coroutines-with-boost-c-libraries/">[3]</a> демонстрирует использование Boost.Asio с Coroutines TS и boost::future. В своей статье я хочу показать, как можно обойтись без boost::future. Мы возьмем за основу <a href="http://www.boost.org/doc/libs/1_66_0/doc/html/boost_asio/example/cpp11/echo/async_tcp_echo_server.cpp">пример</a> асинхронного TCP эхо-сервера из Boost.Asio и будем его модифицировать, используя сопрограммы из Coroutines TS.</p>
+<p>На момент написания статьи Coroutines TS реализована в компиляторах Visual C++ 2017 и clang 5.0. Мы будем использовать clang. Необходимо установить флаги компилятора для включения экспериментальной поддержки стандарта C++ 20 (-std=c++2a) и Coroutines TS (-fcoroutines-ts). Также нужно включить заголовочный файл &lt;experimental/coroutine&gt;.</p>
+
+
+
+<h1>Сопрограмма для чтения из сокета</h1>
+
+<p>В оригинальном примере функция для чтения из сокета выглядит так:</p>
+<pre>
+void do_read() {
+    auto self(shared_from_this());
+    socket_.async_read_some(
+        boost::asio::buffer(data_, max_length),
+        [this, self](boost::system::error_code ec, std::size_t length) {
+            if (!ec) {
+                do_write(length);
+            }
+        });
+}
+</pre>
+
+<p>Мы инициируем асинхронное чтение из сокета и задаем коллбек, который будет вызван при получении данных и инициирует их отсылку обратно. Функция записи в оригинале выглядит так:</p>
+<pre>
+void do_write(std::size_t length) {
+    auto self(shared_from_this());
+    boost::asio::async_write(
+        socket_, boost::asio::buffer(data_, length),
+        [this, self](boost::system::error_code ec, std::size_t /*length*/) {
+            if (!ec) {
+                do_read();
+            }
+        });
+}
+</pre>
+
+<p>При успешной записи данных в сокет мы снова инициируем асинхронное чтение. По сути, логика программы сводится к циклу (псевдокод):</p>
+<pre>
+while (!ec)
+{
+	ec = read(buffer);
+	if (!ec)
+	{
+		ec = write(buffer);
+	}
+}
+</pre>
+
+<p>Было бы удобно закодировать это в виде явного цикла, однако в таком случае нам пришлось бы сделать чтение и запись синхронными операциями. Нам это не подходит, поскольку мы хотим обслуживать несколько клиентских сессий в одном потоке выполнения одновременно. На помощь приходят сопрограммы. Перепишем функцию do_read() в следующем виде:</p>
+<pre>
+void do_read() {
+    auto self(shared_from_this());
+    const auto[ec, length] = co_await async_read_some(
+        socket_, boost::asio::buffer(data_, max_length));
+
+    if (!ec) {
+        do_write(length);
+    }
+}
+</pre>
+
+<p>Использование ключевого слова co_await (а также co_yield и co_return) превращает функцию в сопрограмму. Такая функция имеет несколько точек (suspension point), где ее выполнение приостанавливается (suspend) с сохранением состояния (значений локальных переменных). Позже выполнение сопрограммы может быть возобновлено (resume), начиная с последней остановки. Ключевое слово co_await в нашей функции создает suspension point: после того, как асинхронное чтение инициировано, выполнение сопрограммы do_read() будет приостановлено до завершения чтения. Возврата из функции при этом не происходит, но выполнение программы продолжается, начиная с точки вызова сопрограммы. Когда клиент подключается, вызывается  session::start(), где do_read() вызывается первый раз для этой сессии. После начала асинхронного чтения продолжается выполнение функции start(), происходит возврат из нее и инициируется прием следующего соединения. Далее продолжает выполнение код из Asio, который вызвал обработчик-аргумент async_accept().</p>
+<p>Для того, чтобы магия co_await работала, его выражение - в нашем случае функция async_read_some() - должен возвращать объект класса, который соответствует определенному контракту. Реализация async_read_some() взята из комментария к статье <a href="https://blogs.msdn.microsoft.com/vcblog/2017/05/19/using-c-coroutines-with-boost-c-libraries/">[3]</a>.</p>
+<pre>
+template &lt;typename SyncReadStream, typename DynamicBuffer&gt;
+auto async_read_some(SyncReadStream &amp;s, DynamicBuffer &amp;&amp;buffers) {
+    struct Awaiter {
+        SyncReadStream &amp;s;
+        DynamicBuffer &amp;&amp;buffers;
+
+        std::error_code ec;
+        size_t sz;
+
+        bool await_ready() { return false; }
+        void await_suspend(std::experimental::coroutine_handle&lt;&gt; coro) {
+            s.async_read_some(std::move(buffers),
+                              [this, coro](auto ec, auto sz) mutable {
+                                  this-&gt;ec = ec;
+                                  this-&gt;sz = sz;
+                                  coro.resume();
+                              });
+        }
+        auto await_resume() { return std::make_pair(ec, sz); }
+    };
+    return Awaiter{s, std::forward&lt;DynamicBuffer&gt;(buffers)};
+}
+</pre>
+
+<p>async_read_some() возвращает объект класса Awaiter, который реализует контракт, требуемый co_await:</p>
+<ul>
+<li>await_ready() вызывается в начале ожидания для проверки, готов ли уже результат асинхронной операции. Поскольку для получения результата нам всегда нужно дождаться, пока данные будут прочитаны, мы возвращаем false.</li>
+<li>await_suspend() вызывается перед тем, как вызывающая сопрограмма будет приостановлена. Здесь мы инициируем асинхронное чтение и передаем обработчик, который сохранит результаты выполнения асинхронной операции в переменных-членах класса Awaiter и возобновит сопрограмму.</li>
+<li>await_resume() - возвращаемое значение этой функции будет результатом выполнения co_await. Просто возвращаем сохраненные ранее результаты выполнения асинхронной операции.</li>
+</ul>
+<p>Если теперь попытаться собрать нашу программу, то получим ошибку компиляции:</p>
+<pre>
+error: this function cannot be a coroutine: &#039;std::experimental::coroutines_v1::coroutine_traits&lt;void, session &amp;&gt;&#039; has no member named &#039;promise_type&#039;
+    void do_read() {
+         ^
+</pre>
+
+<p>Причина в том, что компилятор требует, чтобы для сопрограммы тоже был реализован некоторый контракт. Это делается с помощью специализации шаблона std::experimental::coroutine_traits:</p>
+<pre>
+template &lt;typename... Args&gt;
+struct std::experimental::coroutine_traits&lt;void, Args...&gt; {
+    struct promise_type {
+        void get_return_object() {}
+        std::experimental::suspend_never initial_suspend() { return {}; }
+        std::experimental::suspend_never final_suspend() { return {}; }
+        void return_void() {}
+        void unhandled_exception() { std::terminate(); }
+    };
+};
+</pre>
+
+<p>Мы специализировали coroutine_traits для сопрограмм с возращаемым значением типа void и любым количеством и типами параметров. Сопрограмма do_read() подходит под это описание. Специализация шаблона содержит тип promise_type с следующими функциями:</p>
+<ul>
+<li>get_return_object() вызывается для создания объекта, который сопрограмма будет впоследствии заполнять и возвращать. В нашем случае ничего создавать не нужно, так как do_read() ничего не возвращает.</li>
+<li>initial_suspend() определяет, будет ли сопрограмма приостановлена перед первым вызовом. Аналогия - запуск приостановленного потока в Windows. Нам нужно, чтобы do_read() выполнялась без начальной остановки, поэтому возвращаем suspend_never.</li>
+<li>final_suspend() определяет, будет ли сопрограмма приостановлена перед возвратом значения и завершением. Возвращаем suspend_never.</li>
+<li>return_void() указывает компилятору, что сопрограмма ничего не возвращает.</li>
+<li>unhandled_exception() вызывается, если внутри сопрограммы было сгенерировано исключение, и оно не было обработано внутри сопрограммы. В этом случае аварийно завершаем программу.</li>
+</ul>
+<p>Теперь можно запустить сервер и проверить его работоспособность, открыв несколько подключений с помощью telnet.</p>
+
+
+
+<h1>Сопрограмма для записи в сокет</h1>
+
+<p>Функция записи do_write() все еще основывается на использовании коллбека. Исправим это. Перепишем do_write() в следующем виде:</p>
+<pre>
+auto do_write(std::size_t length) {
+    auto self(shared_from_this());
+    struct Awaiter {
+        std::shared_ptr&lt;session&gt; ssn;
+        std::size_t length;
+        std::error_code ec;
+
+        bool await_ready() { return false; }
+        auto await_resume() { return ec; }
+        void await_suspend(std::experimental::coroutine_handle&lt;&gt; coro) {
+            const auto[ec, sz] = co_await async_write(
+                ssn-&gt;socket_, boost::asio::buffer(ssn-&gt;data_, length));
+            this-&gt;ec = ec;
+            coro.resume();
+        }
+    };
+    return Awaiter{self, length};
+}
+</pre>
+
+<p>Напишем awaitable-обертку для записи в сокет:</p>
+<pre>
+template &lt;typename SyncReadStream, typename DynamicBuffer&gt;
+auto async_write(SyncReadStream &amp;s, DynamicBuffer &amp;&amp;buffers) {
+    struct Awaiter {
+        SyncReadStream &amp;s;
+        DynamicBuffer &amp;&amp;buffers;
+
+        std::error_code ec;
+        size_t sz;
+
+        bool await_ready() { return false; }
+        auto await_resume() { return std::make_pair(ec, sz); }
+        void await_suspend(std::experimental::coroutine_handle&lt;&gt; coro) {
+            boost::asio::async_write(
+                s, std::move(buffers), [this, coro](auto ec, auto sz) mutable {
+                    this-&gt;ec = ec;
+                    this-&gt;sz = sz;
+                    coro.resume();
+                });
+        }
+    };
+    return Awaiter{s, std::forward&lt;DynamicBuffer&gt;(buffers)};
+}
+</pre>
+
+<p>Последний шаг - перепишем do_read() в виде явного цикла:</p>
+<pre>
+void do_read() {
+    auto self(shared_from_this());
+    while (true) {
+        const auto[ec, sz] = co_await async_read_some(
+            socket_, boost::asio::buffer(data_, max_length));
+        if (!ec) {
+            auto ec = co_await do_write(sz);
+            if (ec) {
+                std::cout &lt;&lt; &quot;Error writing to socket: &quot; &lt;&lt; ec &lt;&lt; std::endl;
+                break;
+            }
+        } else {
+            std::cout &lt;&lt; &quot;Error reading from socket: &quot; &lt;&lt; ec &lt;&lt; std::endl;
+            break;
+        }
+    }
+}
+</pre>
+
+<p>Логика программы теперь записана в виде, близком к синхронному коду, однако она выполняется асинхронно. Ложкой дёгтя является то, что нам пришлось написать дополнительный awaitable-класс для возвращаемого значения do_write(). Это иллюстрирует один из недостатков Coroutines TS - распространение co_await вверх по стеку асинхронных вызовов <a href="https://habrahabr.ru/post/278267/">[4]</a>.</p>
+<p>Переделку функции server::do_accept() в сопрограмму оставим в качестве упражнения. Полный текст программы можно найти на <a href="https://github.com/ysynov/asio_coro/blob/master/async_tcp_echo_server.cpp">GitHub</a>.</p>
+
+
+<h1>Заключение</h1>
+<p>Мы рассмотрели использование Boost.Asio с Coroutines TS для программирования асинхронных сетевых приложений. Преимущество такого подхода - улучшение читабельности кода, поскольку он становится близок по форме к синхронному. Недостаток - необходимость в написании дополнительных оберток для поддержки модели сопрограмм, реализованной в Coroutines TS.</p>
+
+<h1>Ссылки</h1>
+<ol>
+<li><a href="https://habrahabr.ru/post/201826/">Асинхронность: назад в будущее</a></li>
+<li><a href="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2017/n4649.pdf">Working Draft, Technical Specification for C++ Extensions for Coroutines</a></li>
+<li><a href="https://blogs.msdn.microsoft.com/vcblog/2017/05/19/using-c-coroutines-with-boost-c-libraries/">Using C++ Coroutines with Boost C++ Libraries</a></li>
+<li><a href="https://habrahabr.ru/post/278267/">Возражения против принятия Coroutines с await в C++17</a></li>
+</ol>
+
