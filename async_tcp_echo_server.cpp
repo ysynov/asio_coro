@@ -8,27 +8,14 @@
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 
+#include <boost/asio.hpp>
 #include <cstdlib>
 #include <experimental/coroutine>
 #include <iostream>
 #include <memory>
 #include <utility>
 
-#include <boost/asio.hpp>
-
 using boost::asio::ip::tcp;
-
-template <typename... Args>
-struct std::experimental::coroutine_traits<std::error_code, Args...> {
-    struct promise_type {
-        std::error_code res;
-        auto get_return_object() { return res; }
-        std::experimental::suspend_never initial_suspend() { return {}; }
-        std::experimental::suspend_never final_suspend() { return {}; }
-        void return_value(std::error_code v) { res = v; }
-        void unhandled_exception() { std::terminate(); }
-    };
-};
 
 template <typename... Args>
 struct std::experimental::coroutine_traits<void, Args...> {
@@ -57,6 +44,7 @@ auto async_read_some(SyncReadStream &s, DynamicBuffer &&buffers) {
                               [this, coro](auto ec, auto sz) mutable {
                                   this->ec = ec;
                                   this->sz = sz;
+                                  std::cout << "read completed" << std::endl;
                                   coro.resume();
                               });
         }
@@ -76,12 +64,13 @@ auto async_write(SyncReadStream &s, DynamicBuffer &&buffers) {
         bool await_ready() { return false; }
         auto await_resume() { return std::make_pair(ec, sz); }
         void await_suspend(std::experimental::coroutine_handle<> coro) {
-            boost::asio::async_write(s, std::move(buffers),
-                                     [this, coro](auto ec, auto sz) mutable {
-                                         this->ec = ec;
-                                         this->sz = sz;
-                                         coro.resume();
-                                     });
+            boost::asio::async_write(
+                s, std::move(buffers), [this, coro](auto ec, auto sz) mutable {
+                    this->ec = ec;
+                    this->sz = sz;
+                    std::cout << "write completed" << std::endl;
+                    coro.resume();
+                });
         }
     };
     return Awaiter{s, std::forward<DynamicBuffer>(buffers)};
@@ -114,13 +103,37 @@ class session : public std::enable_shared_from_this<session> {
     void start() { do_read(); }
 
   private:
+    auto do_write(std::size_t length) {
+        auto self(shared_from_this());
+        struct Awaiter {
+            std::shared_ptr<session> ssn;
+            std::size_t length;
+            std::error_code ec;
+
+            bool await_ready() { return false; }
+            auto await_resume() { return ec; }
+            void await_suspend(std::experimental::coroutine_handle<> coro) {
+                const auto[ec, sz] = co_await async_write(
+                    ssn->socket_, boost::asio::buffer(ssn->data_, length));
+                this->ec = ec;
+                std::cout << "do_write completed" << std::endl;
+                coro.resume();
+            }
+        };
+        return Awaiter{self, length};
+    }
+
     void do_read() {
         auto self(shared_from_this());
         while (true) {
+            std::cout << "before read" << std::endl;
             const auto[ec, sz] = co_await async_read_some(
                 socket_, boost::asio::buffer(data_, max_length));
+            std::cout << "after read" << std::endl;
             if (!ec) {
-                auto ec = do_write(sz);
+                std::cout << "before write" << std::endl;
+                auto ec = co_await do_write(sz);
+                std::cout << "after write" << std::endl;
                 if (ec) {
                     std::cout << "Error writing to socket: " << ec << std::endl;
                     break;
@@ -130,13 +143,6 @@ class session : public std::enable_shared_from_this<session> {
                 break;
             }
         }
-    }
-
-    std::error_code do_write(std::size_t length) {
-        auto self(shared_from_this());
-        const auto[ec, sz] =
-            co_await async_write(socket_, boost::asio::buffer(data_, length));
-        co_return ec;
     }
 
     tcp::socket socket_;
