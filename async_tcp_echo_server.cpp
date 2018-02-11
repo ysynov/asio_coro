@@ -56,7 +56,7 @@ template <typename SyncReadStream, typename DynamicBuffer>
 auto async_write(SyncReadStream &s, DynamicBuffer &&buffers) {
     struct Awaiter {
         SyncReadStream &s;
-        DynamicBuffer &&buffers;
+        DynamicBuffer buffers;
 
         std::error_code ec;
         size_t sz;
