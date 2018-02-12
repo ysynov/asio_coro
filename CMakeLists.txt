@@ -6,3 +6,7 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -nodefaultlibs -lc++ -lc++
 
 add_executable (async_tcp_echo_server async_tcp_echo_server.cpp)
 target_link_libraries(async_tcp_echo_server boost_system pthread)
+
+add_executable (async_tcp_echo_server_cppcoro async_tcp_echo_server_cppcoro.cpp)
+target_link_libraries(async_tcp_echo_server_cppcoro boost_system pthread)
+
